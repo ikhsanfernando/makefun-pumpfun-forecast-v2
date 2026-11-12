@@ -1,5 +1,4 @@
 import bisect
-import heapq
 import json
 import math
 import os
@@ -7,16 +6,18 @@ import random
 from datetime import datetime, timezone
 
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-
+IN = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+OUT = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
 PATHS = 4000
+PLACES = 5
+MICRO = 1_000_000
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def parse_hours(value):
-    if isinstance(value, (int, float)):
+def hour(value):
+    if isinstance(value, (int, float)) and math.isfinite(value):
         return float(value)
-    text = str(value)
+    text = str(value).strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     moment = datetime.fromisoformat(text)
@@ -25,74 +26,128 @@ def parse_hours(value):
     return moment.timestamp() / 3600.0
 
 
-def log_cap(row):
-    lamports = int(str(row["market_cap_lamports"]))
+def cap_of(row):
+    lamports = int(str(row["market_cap_lamports"]).strip())
     if lamports <= 0:
-        raise ValueError("market cap must be positive")
+        raise ValueError("non-positive market cap")
     return math.log10(lamports) - 9.0
 
 
-def default_edges():
-    return [2.0 + 0.05 * i for i in range(81)]
+def edges_of(task):
+    try:
+        raw = task["size"]["edges"]
+        if not isinstance(raw, list) or len(raw) != 81:
+            raise ValueError("bad edges")
+        edges = [float(x) for x in raw]
+        if any(not math.isfinite(x) for x in edges):
+            raise ValueError("bad edge")
+        if any(a >= b for a, b in zip(edges, edges[1:])):
+            raise ValueError("unsorted edges")
+        return edges
+    except Exception:
+        return [2.0 + 0.05 * i for i in range(81)]
 
 
 def load_task():
-    with open(os.path.join(INPUT_DIR, "task.json"), "r", encoding="utf-8") as handle:
+    with open(os.path.join(IN, "task.json"), encoding="utf-8") as handle:
         task = json.load(handle)
     if not isinstance(task, dict):
-        raise ValueError("task must be an object")
+        raise ValueError("task is not an object")
     return task
 
 
 def load_marks():
     marks = []
-    path = os.path.join(INPUT_DIR, "history.ndjson")
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(os.path.join(IN, "history.ndjson"), encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             try:
                 mark = json.loads(line)
+                if not isinstance(mark, dict) or mark.get("ok") is False:
+                    continue
+                rows = mark.get("rows")
+                if not isinstance(rows, list):
+                    continue
+                at = hour(mark["at"])
+                marks.append((at, mark))
             except Exception:
                 continue
-            if isinstance(mark, dict) and isinstance(mark.get("rows"), list):
-                marks.append(mark)
     if not marks:
-        raise ValueError("history has no marks")
+        raise ValueError("no usable marks")
+    marks.sort(key=lambda item: item[0])
     return marks
 
 
-def rounded_to_cap(rows, cap, exact=False):
-    total = math.fsum(value for _, value in rows)
-    if total > 0.0 and (exact or total > cap):
-        factor = cap / total
-    else:
-        factor = 1.0
-    result = [(key, round(value * factor, 6)) for key, value in rows]
-    result = [(key, min(1.0, max(0.0, value))) for key, value in result]
+def normalise(items, cap):
+    """Round to 6 places, keep p >= .002, and keep the total at or below cap."""
+    if not items:
+        return []
+    total = math.fsum(p for _, p in items)
+    if not math.isfinite(total) or total <= 0.0:
+        return []
+    scale = cap / total if total > cap else 1.0
+    kept = []
+    for key, p in items:
+        micro = int(round(p * scale * MICRO))
+        if micro >= 2000:
+            kept.append([key, micro])
+    if not kept:
+        return []
+    limit = int(round(cap * MICRO))
+    excess = sum(micro for _, micro in kept) - limit
+    if excess > 0:
+        index = max(range(len(kept)), key=lambda i: kept[i][1])
+        kept[index][1] -= excess
+        kept = [item for item in kept if item[1] >= 2000]
+    return [(key, micro / MICRO) for key, micro in kept]
 
-    excess = math.fsum(value for _, value in result) - cap
-    if excess > 0.0:
-        largest = max(range(len(result)), key=lambda index: result[index][1])
-        key, value = result[largest]
-        result[largest] = (key, round(max(0.0, value - excess), 6))
+
+def placeholders(count=5):
+    return ["1" * 43 + BASE58[i % len(BASE58)] for i in range(count)]
+
+
+def fill_top(selected, known):
+    result = []
+    seen = set()
+    for mint in list(selected) + list(known) + placeholders(5):
+        if isinstance(mint, str) and mint and mint not in seen:
+            seen.add(mint)
+            result.append(mint)
+            if len(result) == 5:
+                break
     return result
 
 
 def compute(task, marks):
-    places = int(task.get("places", 5))
-    edges = [float(edge) for edge in task["size"]["edges"]]
-    reads = list(task.get("reads") or [])
+    edges = edges_of(task)
+    reads = task.get("reads")
+    reads = reads if isinstance(reads, list) else []
+    last_hour = marks[-1][0]
+    ahead = []
+    for read in reads:
+        try:
+            delta = hour(read) - last_hour
+            if delta > 0.0 and math.isfinite(delta):
+                ahead.append(delta)
+        except Exception:
+            pass
+    if not ahead:
+        ahead = [1.0] * (len(reads) or 7)
 
     series = {}
-    for mark in marks:
-        at = parse_hours(mark["at"])
+    for at, mark in marks:
         for row in mark["rows"]:
-            mint = row["mint"]
-            if not isinstance(mint, str) or not mint:
+            try:
+                mint = row["mint"]
+                if not isinstance(mint, str) or not mint:
+                    continue
+                series.setdefault(mint, []).append((at, cap_of(row)))
+            except Exception:
                 continue
-            series.setdefault(mint, []).append((at, log_cap(row)))
+    if not series:
+        raise ValueError("no priced coins")
 
     coins = []
     residuals = []
@@ -102,17 +157,14 @@ def compute(task, marks):
         last_t, last_x = observations[-1]
         dt = last_t - first_t
         if len(observations) >= 2 and dt > 0.0:
-            mu = (last_x - first_x) / dt
-            mu = min(0.35, max(-0.25, mu))
+            mu = min(0.35, max(-0.25, (last_x - first_x) / dt))
         else:
             mu = 0.03
-
         if len(observations) >= 2:
             for (t1, x1), (t2, x2) in zip(observations, observations[1:]):
                 step = t2 - t1
                 if step > 0.0:
                     residuals.append(((x2 - x1) - mu * step) ** 2 / step)
-
         coins.append((mint, last_x, mu))
 
     if residuals:
@@ -121,166 +173,138 @@ def compute(task, marks):
     else:
         sigma = 0.12
 
-    last_time = parse_hours(marks[-1]["at"])
-    hours = []
-    for read in reads:
-        delta = parse_hours(read) - last_time
-        if delta > 0.0:
-            hours.append(delta)
-    if not hours:
-        hours = [1.0] * len(reads)
-    if not hours:
-        raise ValueError("task has no reads")
-
     rng = random.Random(12345)
-    place_counts = {place: {} for place in range(1, places + 1)}
-    place_bins = {place: {} for place in range(1, places + 1)}
-
+    place_counts = [dict() for _ in range(PLACES)]
+    place_bins = [dict() for _ in range(PLACES)]
+    samples = 0
     for _ in range(PATHS):
-        for hours_ahead in hours:
-            root_hours = math.sqrt(hours_ahead)
+        for hours in ahead:
+            root_hours = math.sqrt(hours)
             simulated = []
             for mint, start, mu in coins:
-                x = start + mu * hours_ahead + sigma * root_hours * rng.gauss(0.0, 1.0)
-                x = min(7.0, max(1.0, x))
-                simulated.append((mint, x))
-            ranked = heapq.nsmallest(
-                places, simulated, key=lambda item: (-item[1], item[0])
-            )
-            for place, (mint, cap) in enumerate(ranked, start=1):
+                x = start + mu * hours + sigma * root_hours * rng.gauss(0.0, 1.0)
+                simulated.append((mint, min(7.0, max(1.0, x))))
+            simulated.sort(key=lambda item: (-item[1], item[0]))
+            for place, (mint, x) in enumerate(simulated[:PLACES]):
                 counts = place_counts[place]
                 counts[mint] = counts.get(mint, 0) + 1
-                bin_number = bisect.bisect_right(edges, cap)
+                bin_number = bisect.bisect_right(edges, x)
                 bins = place_bins[place]
                 bins[bin_number] = bins.get(bin_number, 0) + 1
+            samples += 1
 
     probabilities = []
-    for place in range(1, places + 1):
-        kept = [
-            (mint, count / PATHS)
-            for mint, count in place_counts[place].items()
-            if count / PATHS >= 0.002
-        ]
-        kept.sort(key=lambda item: (-item[1], item[0]))
-        kept = kept[:60]
-        for mint, probability in rounded_to_cap(kept, 0.85):
-            probabilities.append({"mint": mint, "place": place, "p": probability})
+    for place in range(PLACES):
+        raw = [(mint, count / samples) for mint, count in place_counts[place].items()]
+        raw = [item for item in raw if item[1] >= 0.002]
+        raw.sort(key=lambda item: (-item[1], item[0]))
+        for mint, p in normalise(raw[:60], 0.85):
+            probabilities.append({"mint": mint, "place": place + 1, "p": p})
 
-    total_samples = PATHS * len(hours)
     sizes = []
-    for place in range(1, places + 1):
-        kept = [
-            (bin_number, count / total_samples)
-            for bin_number, count in place_bins[place].items()
-            if count / total_samples >= 0.002
-        ]
-        kept.sort(key=lambda item: (-item[1], item[0]))
-        kept = kept[:60]
-        for bin_number, probability in rounded_to_cap(kept, 0.90):
-            sizes.append({"place": place, "bin": bin_number, "p": probability})
+    for place in range(PLACES):
+        raw = [(bin_number, count / samples) for bin_number, count in place_bins[place].items()]
+        raw = [item for item in raw if item[1] >= 0.002]
+        raw.sort(key=lambda item: (-item[1], item[0]))
+        for bin_number, p in sorted(normalise(raw[:60], 0.90)):
+            sizes.append({"place": place + 1, "bin": bin_number, "p": p})
 
-    mint_totals = {}
-    mint_best = {}
+    totals = {}
+    best = {}
     for row in probabilities:
-        mint = row["mint"]
-        place = row["place"]
-        probability = row["p"]
-        mint_totals[mint] = mint_totals.get(mint, 0.0) + probability
-        previous = mint_best.get(mint)
-        if previous is None or place < previous[0] or (place == previous[0] and probability > previous[1]):
-            mint_best[mint] = (place, probability)
-
-    leaders = sorted(mint_totals, key=lambda mint: (-mint_totals[mint], mint))[:5]
-    if len(leaders) < 5:
-        for mint, _, _ in sorted(coins, key=lambda item: (-item[1], item[0])):
-            if mint not in mint_best:
-                mint_best[mint] = (places + 1, 0.0)
-                mint_totals[mint] = 0.0
-                leaders.append(mint)
-            if len(leaders) == 5:
-                break
-    leaders.sort(
-        key=lambda mint: (
-            mint_best[mint][0],
-            -mint_best[mint][1],
-            -mint_totals[mint],
-            mint,
-        )
-    )
-
-    return {"probabilities": probabilities, "top5": leaders, "sizes": sizes}
+        mint, place, p = row["mint"], row["place"], row["p"]
+        totals[mint] = totals.get(mint, 0.0) + p
+        old = best.get(mint)
+        if old is None or place < old[0] or (place == old[0] and p > old[1]):
+            best[mint] = (place, p)
+    selected = sorted(totals, key=lambda mint: (-totals[mint], mint))[:5]
+    selected.sort(key=lambda mint: (best[mint][0], -best[mint][1], -totals[mint], mint))
+    known = [mint for mint, _, _ in sorted(coins, key=lambda item: (-item[1], item[0]))]
+    top5 = fill_top(selected, known)
+    return {"probabilities": probabilities, "sizes": sizes, "top5": top5}
 
 
 def fallback(task, marks):
-    edges = default_edges()
-    if isinstance(task, dict):
+    edges = edges_of(task)
+    chart = []
+    known = []
+    if marks:
+        rows = [row for row in marks[-1][1].get("rows", []) if isinstance(row, dict)]
         try:
-            edges = [float(edge) for edge in task["size"]["edges"]]
+            rows.sort(key=lambda row: (int(row.get("rank", 10**9)), str(row.get("mint", ""))))
         except Exception:
             pass
-
-    chart = []
-    if marks:
-        rows = [
-            row
-            for row in marks[-1].get("rows", [])
-            if isinstance(row, dict)
-            and isinstance(row.get("mint"), str)
-            and row.get("mint")
-        ]
-        rows.sort(key=lambda row: (int(row.get("rank", 10**9)), str(row.get("mint", ""))))
         chart = rows
+        for _, mark in reversed(marks):
+            for row in mark.get("rows", []):
+                mint = row.get("mint") if isinstance(row, dict) else None
+                if isinstance(mint, str) and mint and mint not in known:
+                    known.append(mint)
 
-    mints = [row.get("mint") for row in chart if isinstance(row.get("mint"), str) and row.get("mint")]
-    top5 = mints[:5]
+    chart_mints = []
+    for row in chart:
+        mint = row.get("mint")
+        if isinstance(mint, str) and mint and mint not in chart_mints:
+            chart_mints.append(mint)
+    top5 = fill_top(chart_mints[:5], chart_mints + known)
 
     probabilities = []
     sizes = []
-    for place in range(1, 6):
+    for place in range(1, PLACES + 1):
         entries = {}
         if place <= len(chart):
             entries[chart[place - 1]["mint"]] = 0.60
-        if 1 <= place - 1 <= len(chart):
+        if place > 1 and place - 2 < len(chart):
             mint = chart[place - 2]["mint"]
             entries[mint] = entries.get(mint, 0.0) + 0.15
-        if place + 1 <= len(chart):
+        if place < len(chart):
             mint = chart[place]["mint"]
             entries[mint] = entries.get(mint, 0.0) + 0.15
-
         rows = sorted(entries.items(), key=lambda item: (-item[1], item[0]))
-        for mint, probability in rounded_to_cap(rows, 0.85, exact=True):
-            probabilities.append({"mint": mint, "place": place, "p": probability})
-
+        for mint, p in normalise(rows, 0.85):
+            probabilities.append({"mint": mint, "place": place, "p": p})
         if place <= len(chart):
             try:
-                bin_number = bisect.bisect_right(edges, log_cap(chart[place - 1]))
-                sizes.append({"place": place, "bin": bin_number, "p": 0.9})
+                bin_number = bisect.bisect_right(edges, cap_of(chart[place - 1]))
+                sizes.append({"place": place, "bin": bin_number, "p": 0.90})
             except Exception:
                 pass
-
-    return {"probabilities": probabilities, "top5": top5, "sizes": sizes}
+    return {"probabilities": probabilities, "sizes": sizes, "top5": top5}
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    task = None
-    marks = []
     try:
-        task = load_task()
-        marks = load_marks()
-        forecast = compute(task, marks)
+        os.makedirs(OUT, exist_ok=True)
+        task = {}
+        marks = []
+        try:
+            task = load_task()
+        except Exception:
+            pass
+        try:
+            marks = load_marks()
+        except Exception:
+            pass
+        try:
+            forecast = compute(task, marks)
+        except Exception:
+            try:
+                forecast = fallback(task, marks)
+            except Exception:
+                forecast = {
+                    "probabilities": [],
+                    "sizes": [],
+                    "top5": fill_top([], []),
+                }
+        with open(os.path.join(OUT, "forecast.json"), "w", encoding="utf-8") as handle:
+            json.dump(forecast, handle, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     except Exception:
         try:
-            if task is None:
-                task = load_task()
-            if not marks:
-                marks = load_marks()
-            forecast = fallback(task, marks)
+            os.makedirs(OUT, exist_ok=True)
+            with open(os.path.join(OUT, "forecast.json"), "w", encoding="utf-8") as handle:
+                json.dump({"probabilities": [], "sizes": [], "top5": fill_top([], [])}, handle, separators=(",", ":"))
         except Exception:
-            forecast = {"probabilities": [], "top5": [], "sizes": []}
-
-    with open(os.path.join(OUTPUT_DIR, "forecast.json"), "w", encoding="utf-8") as handle:
-        json.dump(forecast, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            pass
 
 
 if __name__ == "__main__":
