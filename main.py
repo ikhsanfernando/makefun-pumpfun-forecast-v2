@@ -167,6 +167,11 @@ def compute(task, marks):
                     residuals.append(((x2 - x1) - mu * step) ** 2 / step)
         coins.append((mint, last_x, mu))
 
+    # calibrasi: pakai median drift lintas coin (drift per-coin terlalu noise di 6 snapshot)
+    if coins:
+        med_mu = sorted(c[2] for c in coins)[len(coins) // 2]
+        coins = [(m, x, med_mu) for (m, x, _mu) in coins]
+
     if residuals:
         sigma = math.sqrt(math.fsum(residuals) / len(residuals))
         sigma = min(0.60, max(0.02, sigma))
@@ -198,7 +203,7 @@ def compute(task, marks):
         raw = [(mint, count / samples) for mint, count in place_counts[place].items()]
         raw = [item for item in raw if item[1] >= 0.002]
         raw.sort(key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(raw[:60], 0.85):
+        for mint, p in normalise(raw[:60], 0.75):
             probabilities.append({"mint": mint, "place": place + 1, "p": p})
 
     sizes = []
@@ -206,7 +211,7 @@ def compute(task, marks):
         raw = [(bin_number, count / samples) for bin_number, count in place_bins[place].items()]
         raw = [item for item in raw if item[1] >= 0.002]
         raw.sort(key=lambda item: (-item[1], item[0]))
-        for bin_number, p in sorted(normalise(raw[:60], 0.90)):
+        for bin_number, p in sorted(normalise(raw[:60], 0.97)):
             sizes.append({"place": place + 1, "bin": bin_number, "p": p})
 
     totals = {}
@@ -261,12 +266,12 @@ def fallback(task, marks):
             mint = chart[place]["mint"]
             entries[mint] = entries.get(mint, 0.0) + 0.15
         rows = sorted(entries.items(), key=lambda item: (-item[1], item[0]))
-        for mint, p in normalise(rows, 0.85):
+        for mint, p in normalise(rows, 0.75):
             probabilities.append({"mint": mint, "place": place, "p": p})
         if place <= len(chart):
             try:
                 bin_number = bisect.bisect_right(edges, cap_of(chart[place - 1]))
-                sizes.append({"place": place, "bin": bin_number, "p": 0.90})
+                sizes.append({"place": place, "bin": bin_number, "p": 0.97})
             except Exception:
                 pass
     return {"probabilities": probabilities, "sizes": sizes, "top5": top5}
